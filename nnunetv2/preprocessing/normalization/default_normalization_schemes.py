@@ -96,3 +96,34 @@ class RGBTo01Normalization(ImageNormalization):
         image /= 255.
         return image
 
+
+class HistologyNormalization(ImageNormalization):
+    """
+    Normalization for grayscale histology images.
+
+    Clips intensity to the [low_percentile, high_percentile] range computed
+    per-image, then rescales linearly to [0, 1].  This removes staining
+    outliers and scanner-dependent intensity offsets without requiring
+    dataset-level statistics.
+
+    Activated automatically when the channel name in dataset.json is
+    'histology' (case-insensitive).
+    """
+    leaves_pixels_outside_mask_at_zero_if_use_mask_for_norm_is_true = False
+
+    # Percentile bounds – can be overridden by subclasses
+    low_percentile: float = 1.0
+    high_percentile: float = 99.0
+
+    def run(self, image: np.ndarray, seg: np.ndarray = None) -> np.ndarray:
+        image = image.astype(self.target_dtype, copy=False)
+        p_low, p_high = np.percentile(image, [self.low_percentile, self.high_percentile])
+        if p_high <= p_low:
+            # Flat image – nothing to normalise; return zeros
+            image -= p_low
+            return image
+        np.clip(image, p_low, p_high, out=image)
+        image -= p_low
+        image /= (p_high - p_low)   # → [0, 1]
+        return image
+
