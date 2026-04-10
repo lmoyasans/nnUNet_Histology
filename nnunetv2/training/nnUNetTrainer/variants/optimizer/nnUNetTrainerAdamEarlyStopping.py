@@ -116,7 +116,7 @@ class nnUNetTrainerAdamEarlyStopping(nnUNetTrainerAdam):
             self.print_to_log_file(
                 f"[train_step] NaN/Inf loss detected — skipping backward for this batch."
             )
-            return {'loss': float('nan')}
+            return {'loss': np.array(np.nan)}
 
         if self.grad_scaler is not None:
             self.grad_scaler.scale(l).backward()

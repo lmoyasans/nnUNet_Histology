@@ -1,5 +1,6 @@
 import torch
 from nnunetv2.training.loss.dice import SoftDiceLoss, MemoryEfficientSoftDiceLoss
+from nnunetv2.training.loss.tversky import SoftTverskyLoss, MemoryEfficientSoftTverskyLoss
 from nnunetv2.training.loss.robust_ce_loss import RobustCrossEntropyLoss, TopKLoss
 from nnunetv2.utilities.helpers import softmax_helper_dim1
 from torch import nn
@@ -154,3 +155,59 @@ class DC_and_topk_loss(nn.Module):
 
         result = self.weight_ce * ce_loss + self.weight_dice * dc_loss
         return result
+
+
+class Tversky_and_CE_loss(nn.Module):
+    """
+    Tversky loss + Cross Entropy loss for improved recall on minority classes.
+    
+    Tversky loss with β > α penalizes false negatives more than false positives,
+    which helps when recall is more important than precision (e.g., detecting fascicles).
+    """
+    def __init__(self, soft_tversky_kwargs, ce_kwargs, weight_ce=1, weight_tversky=1, ignore_label=None,
+                 tversky_class=MemoryEfficientSoftTverskyLoss, alpha=0.3, beta=0.7):
+        """
+        Args:
+            soft_tversky_kwargs: Kwargs for Tversky loss (batch_dice, smooth, do_bg, ddp)
+            ce_kwargs: Kwargs for CE loss (weight)
+            weight_ce: Weight for CE loss (default 1)
+            weight_tversky: Weight for Tversky loss (default 1)
+            ignore_label: Label to ignore
+            tversky_class: Tversky loss class to use
+            alpha: FP penalty (default 0.3)
+            beta: FN penalty (default 0.7) - higher = more recall
+        """
+        super(Tversky_and_CE_loss, self).__init__()
+        if ignore_label is not None:
+            ce_kwargs['ignore_index'] = ignore_label
+
+        self.weight_tversky = weight_tversky
+        self.weight_ce = weight_ce
+        self.ignore_label = ignore_label
+
+        self.ce = RobustCrossEntropyLoss(**ce_kwargs)
+        self.tversky = tversky_class(apply_nonlin=softmax_helper_dim1, alpha=alpha, beta=beta, 
+                                      **soft_tversky_kwargs)
+
+    def forward(self, net_output: torch.Tensor, target: torch.Tensor):
+        """
+        target must be b, c, x, y(, z) with c=1
+        """
+        if self.ignore_label is not None:
+            assert target.shape[1] == 1, 'ignore label is not implemented for one hot encoded target variables ' \
+                                         '(Tversky_and_CE_loss)'
+            mask = target != self.ignore_label
+            target_tversky = torch.where(mask, target, 0)
+            num_fg = mask.sum()
+        else:
+            target_tversky = target
+            mask = None
+
+        tversky_loss = self.tversky(net_output, target_tversky, loss_mask=mask) \
+            if self.weight_tversky != 0 else 0
+        ce_loss = self.ce(net_output, target[:, 0]) \
+            if self.weight_ce != 0 and (self.ignore_label is None or num_fg > 0) else 0
+
+        result = self.weight_ce * ce_loss + self.weight_tversky * tversky_loss
+        return result
+
