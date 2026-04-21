@@ -16,9 +16,9 @@ important than avoiding false positives (e.g., nerve fascicle detection).
 import torch
 import numpy as np
 from nnunetv2.training.nnUNetTrainer.variants.optimizer.nnUNetTrainerAdamEarlyStopping import nnUNetTrainerAdamEarlyStopping
-from nnunetv2.training.loss.compound_losses import Tversky_and_CE_loss
+from nnunetv2.training.loss.compound_losses import Tversky_and_CE_loss, Tversky_and_CE_loss_PerClass
 from nnunetv2.training.loss.deep_supervision import DeepSupervisionWrapper
-from nnunetv2.training.loss.tversky import MemoryEfficientSoftTverskyLoss
+from nnunetv2.training.loss.tversky import MemoryEfficientSoftTverskyLoss, PerClassFocalTverskyLoss
 
 
 class nnUNetTrainerAdamEarlyStopping_Tversky(nnUNetTrainerAdamEarlyStopping):
@@ -60,16 +60,15 @@ class nnUNetTrainerAdamEarlyStopping_Tversky(nnUNetTrainerAdamEarlyStopping):
             return super()._build_loss()
 
         # Inverse-frequency weights, normalised to sum to num_classes (5).
-        # Same methodology as nnUNetTrainerAdamEarlyStopping._build_loss.
-        # Frequencies measured on the full 5-class combined dataset (300-case sample):
-        #   Class 0 Background           40.06 %   w = 0.384
-        #   Class 1 ConnectivePerineurium 25.79 %   w = 0.597
-        #   Class 2 Adipose              19.93 %   w = 0.772
-        #   Class 3 NerveFascicle        14.22 %   w = 1.082
-        #   Class 4 Blood_vessel          0.005%   w = 2.164  (capped at 2×w3 to avoid instability)
-        # Weights are normalised so that all 5 sum to 5.
+        # Frequencies measured on 500 random TRAINING TILES (actual tile distribution):
+        #   Class 0 Background           57.51 %   w = 0.1925
+        #   Class 1 ConnectivePerineurium 23.32 %   w = 0.4746
+        #   Class 2 Adipose               6.37 %   w = 1.7389  ← minority in tiles
+        #   Class 3 NerveFascicle        12.80 %   w = 0.8647
+        #   Class 4 Blood_vessel          0.00 %   w = 1.7294  (capped at 2×w3)
+        # Weights normalised so that all 5 sum to 5.
         ce_weights = torch.tensor(
-            [0.3840, 0.5969, 0.7722, 1.0819, 2.1639],
+            [0.1925, 0.4746, 1.7389, 0.8647, 1.7294],
             dtype=torch.float32,
             device=self.device,
         )
@@ -119,9 +118,86 @@ class nnUNetTrainerAdamEarlyStopping_TverskyBalanced(nnUNetTrainerAdamEarlyStopp
     Balanced Tversky: α=0.4, β=0.6
     Slight recall bias but more balanced than default.
     """
-    
+
     def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
                  device: torch.device = torch.device('cuda')):
         super().__init__(plans, configuration, fold, dataset_json, device)
         self.tversky_alpha = 0.4
         self.tversky_beta = 0.6
+
+
+class nnUNetTrainerAdamEarlyStopping_TverskyPerClass(nnUNetTrainerAdamEarlyStopping):
+    """
+    Per-class Focal Tversky + corrected weighted CE trainer.
+
+    Improvements over the uniform Tversky trainer:
+      1. Per-class alpha/beta: adipose (cls 2) and fascicle (cls 3) get higher
+         recall bias (beta=0.8) while background/connective stay balanced (beta=0.6).
+      2. Focal exponent gamma=1.33: down-weights easy well-segmented regions and
+         amplifies gradients for hard/missed adipose and fascicle pixels.
+      3. Per-class Tversky loss weights (1.5x for adipose/fascicle vs 0.5x for bg).
+      4. CE weights from actual 500-tile distribution (adipose w=1.74, not 0.77).
+
+    See documentation/improvement_plan_recall.md for full rationale.
+    """
+
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device('cuda')):
+        self.initial_lr = 3e-4
+        super().__init__(plans, configuration, fold, dataset_json, device)
+
+    def configure_optimizers(self):
+        self.initial_lr = 3e-4
+        return super().configure_optimizers()
+
+    def _build_loss(self):
+        if self.label_manager.has_regions:
+            return super()._build_loss()
+
+        from nnunetv2.utilities.helpers import softmax_helper_dim1
+
+        # ── Per-class α, β (сlasses 1–4, background excluded via do_bg=False) ───
+        # Higher recall bias (β=0.8) for adipose (pos 1 in tensor = cls 2)
+        # and fascicle (pos 2 = cls 3); balanced for connective and blood vessel.
+        alpha_per_class = [0.4, 0.2, 0.2, 0.4]   # cls 1, 2, 3, 4
+        beta_per_class  = [0.6, 0.8, 0.8, 0.6]   # cls 1, 2, 3, 4
+        tversky_cw      = [0.5, 1.5, 1.5, 0.5]   # amplify adipose + fascicle
+
+        # ── CE weights from actual training-tile distribution ────────────────
+        ce_weights = torch.tensor(
+            [0.1925, 0.4746, 1.7389, 0.8647, 1.7294],
+            dtype=torch.float32, device=self.device,
+        )
+
+        loss = Tversky_and_CE_loss_PerClass(
+            tversky_kwargs=dict(
+                apply_nonlin=softmax_helper_dim1,
+                alpha=alpha_per_class,
+                beta=beta_per_class,
+                class_weights=tversky_cw,
+                gamma=1.33,
+                smooth=1.0,
+                do_bg=False,
+                batch_dice=self.configuration_manager.batch_dice,
+                ddp=self.is_ddp,
+            ),
+            ce_kwargs={'weight': ce_weights},
+            weight_ce=1.0,
+            weight_tversky=1.0,
+            ignore_label=self.label_manager.ignore_label,
+        )
+
+        if self._do_i_compile():
+            loss.tversky = torch.compile(loss.tversky)
+
+        if self.enable_deep_supervision:
+            deep_supervision_scales = self._get_deep_supervision_scales()
+            weights = np.array([1 / (2 ** i) for i in range(len(deep_supervision_scales))])
+            if self.is_ddp and not self._do_i_compile():
+                weights[-1] = 1e-6
+            else:
+                weights[-1] = 0
+            weights = weights / weights.sum()
+            loss = DeepSupervisionWrapper(loss, weights)
+
+        return loss

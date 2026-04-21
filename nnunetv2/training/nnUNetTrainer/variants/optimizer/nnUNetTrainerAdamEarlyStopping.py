@@ -57,15 +57,17 @@ class nnUNetTrainerAdamEarlyStopping(nnUNetTrainerAdam):
             return super()._build_loss()
 
         # Inverse-frequency weights, normalised to sum to num_classes (5).
-        # Frequencies measured on the full 5-class combined dataset (300-case sample):
-        #   Class 0 Background           40.06 %   w = 0.384
-        #   Class 1 ConnectivePerineurium 25.79 %   w = 0.597
-        #   Class 2 Adipose              19.93 %   w = 0.772
-        #   Class 3 NerveFascicle        14.22 %   w = 1.082
-        #   Class 4 Blood_vessel          0.005%   w = 2.164  (capped at 2×w3 to avoid instability)
-        # Weights are normalised so that all 5 sum to 5.
+        # Frequencies measured on 500 random TRAINING TILES (actual tile distribution):
+        #   Class 0 Background           57.51 %   w = 0.1925
+        #   Class 1 ConnectivePerineurium 23.32 %   w = 0.4746
+        #   Class 2 Adipose               6.37 %   w = 1.7389  ← minority in tiles
+        #   Class 3 NerveFascicle        12.80 %   w = 0.8647
+        #   Class 4 Blood_vessel          0.00 %   w = 1.7294  (capped at 2×w3)
+        # Weights normalised so that all 5 sum to 5.
+        # NOTE: Previous weights (0.384, 0.597, 0.772, 1.082, 2.164) were GTEx-dominated
+        # and incorrectly treated adipose as a majority class (19.93% vs actual 6.37%).
         ce_weights = torch.tensor(
-            [0.3840, 0.5969, 0.7722, 1.0819, 2.1639],
+            [0.1925, 0.4746, 1.7389, 0.8647, 1.7294],
             dtype=torch.float32,
             device=self.device,
         )
