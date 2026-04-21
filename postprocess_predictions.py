@@ -52,11 +52,11 @@ RESULTS_ROOT = os.path.join(_WORKSPACE, 'nnUNet_results', 'Dataset001_NerveMAVI'
 FOLD         = 0
 
 EXPERIMENTS = [
-    ('CE_Histo',   'nnUNetTrainerAdamEarlyStopping_LowLR',   'nnUNetPlans'),
-    ('CE_Nyul',    'nnUNetTrainerAdamEarlyStopping_LowLR',   'nnUNetPlansNyul'),
+    ('CE_Histo',   'nnUNetTrainerAdamEarlyStopping_LowLR',   'nnUNetPlansHistoNorm'),
+    ('CE_Nyul',    'nnUNetTrainerAdamEarlyStopping_LowLR',   'nnUNetPlansNyulNorm'),
     ('CE_NoNorm',  'nnUNetTrainerAdamEarlyStopping_LowLR',   'nnUNetPlansNoNorm'),
-    ('TV_Histo',   'nnUNetTrainerAdamEarlyStopping_Tversky', 'nnUNetPlans'),
-    ('TV_Nyul',    'nnUNetTrainerAdamEarlyStopping_Tversky', 'nnUNetPlansNyul'),
+    ('TV_Histo',   'nnUNetTrainerAdamEarlyStopping_Tversky', 'nnUNetPlansHistoNorm'),
+    ('TV_Nyul',    'nnUNetTrainerAdamEarlyStopping_Tversky', 'nnUNetPlansNyulNorm'),
     ('TV_NoNorm',  'nnUNetTrainerAdamEarlyStopping_Tversky', 'nnUNetPlansNoNorm'),
 ]
 

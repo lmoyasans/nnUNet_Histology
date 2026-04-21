@@ -15,11 +15,11 @@ declare -a TRAINERS=(
   "nnUNetTrainerAdamEarlyStopping_Tversky"
 )
 declare -a PLANS=(
-  "nnUNetPlans"
-  "nnUNetPlansNyul"
+  "nnUNetPlansHistoNorm"
+  "nnUNetPlansNyulNorm"
   "nnUNetPlansNoNorm"
-  "nnUNetPlans"
-  "nnUNetPlansNyul"
+  "nnUNetPlansHistoNorm"
+  "nnUNetPlansNyulNorm"
   "nnUNetPlansNoNorm"
 )
 

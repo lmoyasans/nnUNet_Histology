@@ -59,9 +59,17 @@ class nnUNetTrainerAdamEarlyStopping_Tversky(nnUNetTrainerAdamEarlyStopping):
             # Region-based training: fall back to default
             return super()._build_loss()
 
-        # Same inverse-frequency weights as parent
+        # Inverse-frequency weights, normalised to sum to num_classes (5).
+        # Same methodology as nnUNetTrainerAdamEarlyStopping._build_loss.
+        # Frequencies measured on the full 5-class combined dataset (300-case sample):
+        #   Class 0 Background           40.06 %   w = 0.384
+        #   Class 1 ConnectivePerineurium 25.79 %   w = 0.597
+        #   Class 2 Adipose              19.93 %   w = 0.772
+        #   Class 3 NerveFascicle        14.22 %   w = 1.082
+        #   Class 4 Blood_vessel          0.005%   w = 2.164  (capped at 2×w3 to avoid instability)
+        # Weights are normalised so that all 5 sum to 5.
         ce_weights = torch.tensor(
-            [0.3007, 0.4871, 2.3416, 0.8710],
+            [0.3840, 0.5969, 0.7722, 1.0819, 2.1639],
             dtype=torch.float32,
             device=self.device,
         )

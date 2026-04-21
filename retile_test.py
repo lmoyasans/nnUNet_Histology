@@ -1,8 +1,8 @@
 """
 retile_test.py
 ==============
-Remove old (edge-missing) test tiles and re-tile all 4 test images with
-proper edge tile support (padded partial tiles at image borders).
+Remove old test tiles and re-tile all test images, applying the SAME
+normalization that was used when training tiles were created.
 
 Test images:
   GTEx:      GTEX-1212Z-2725_2.tif  +  GTEX-SSA3-0525_2.tif
@@ -10,19 +10,25 @@ Test images:
   Bio-Aegis: O21574 + O22114  (source: SF_iseg_resampled/)
 
 Strategy:
-  1. Remove all test entries from tile_index.json (+ their image/label files)
-  2. Re-tile GTEx test images directly (using tile_dataset logic)
-  3. Re-tile Bio-Aegis test images (using tile_iseg_dataset logic)
+  1. Read norm used by existing training tiles from tile_index.json.
+  2. Abort if --norm doesn't match (prevents silent train/test mismatch).
+  3. Remove all test entries from tile_index.json (+ their image/label files).
+  4. Re-tile GTEx + Bio-Aegis test images with the same normalization.
   New tiles start at max_train_idx + 1 to avoid any index collision.
+  5. Run a disk-vs-index integrity check and warn of any mismatches.
 
 Usage:
-  python retile_test.py [--dry-run]
+  python retile_test.py --norm none
+  python retile_test.py --norm histology
+  python retile_test.py --norm nyul --scale-file /path/to/nyul_standard_scale.json
+  python retile_test.py --dry-run --norm none
 """
 
 import argparse
 import json
 import math
 import os
+import sys
 
 import hdf5plugin  # must be before h5py
 import h5py
@@ -67,6 +73,96 @@ TISSUE_NAME_TO_CLASS = {
 }
 
 
+# ── Normalization (must match retile_all.py) ─────────────────────────────────
+
+def normalize_image(arr: np.ndarray, method: str, scale_file: str = None) -> np.ndarray:
+    """
+    Normalize a full-resolution grayscale image before tiling.
+    Must be kept in sync with the identical function in retile_all.py.
+
+    method: 'none' | 'histology' | 'nyul'
+    """
+    if method == 'none':
+        return arr
+
+    img = arr.astype(np.float32)
+
+    if method == 'histology':
+        p_low, p_high = np.percentile(img, [1.0, 99.0])
+        if p_high > p_low:
+            np.clip(img, p_low, p_high, out=img)
+            img -= p_low
+            img /= (p_high - p_low)
+        return img
+
+    if method == 'nyul':
+        if scale_file is None or not os.path.exists(scale_file):
+            raise FileNotFoundError(
+                f'Nyul standard scale file not found: {scale_file}\n'
+                'Run: python compute_nyul_scale.py'
+            )
+        with open(scale_file) as _f:
+            _data = json.load(_f)
+        _percentiles    = np.array(_data['percentiles'],    dtype=np.float64)
+        _standard_scale = np.array(_data['standard_scale'], dtype=np.float64)
+        _img_landmarks  = np.percentile(img, _percentiles)
+        img_out = np.interp(img.ravel(), _img_landmarks, _standard_scale)
+        img_out = img_out.reshape(img.shape).astype(np.float32)
+        np.clip(img_out, 0.0, 1.0, out=img_out)
+        return img_out
+
+    raise ValueError(f'Unknown normalization method: {method!r}')
+
+
+# ── Integrity check ───────────────────────────────────────────────────────────
+
+def check_index_integrity(tile_index: dict, images_tr: str, labels_tr: str,
+                          images_ts: str, labels_ts: str) -> bool:
+    """
+    Verify that every entry in tile_index has both image + label files on disk,
+    and that no extra files exist on disk without an index entry.
+    Prints a summary and returns True if everything is clean.
+    """
+    errors = []
+    for case_name, meta in tile_index.items():
+        split = meta.get('split', 'train')
+        img_dir = images_tr if split == 'train' else images_ts
+        lbl_dir = labels_tr if split == 'train' else labels_ts
+        img_p = os.path.join(img_dir, f'{case_name}_0000.tif')
+        lbl_p = os.path.join(lbl_dir, f'{case_name}.tif')
+        if not os.path.exists(img_p):
+            errors.append(f'  MISSING image : {img_p}')
+        if not os.path.exists(lbl_p):
+            errors.append(f'  MISSING label : {lbl_p}')
+
+    # Check for orphan files not in index
+    known = set(tile_index.keys())
+    for img_dir, lbl_dir in [(images_tr, labels_tr), (images_ts, labels_ts)]:
+        if os.path.isdir(img_dir):
+            for fname in os.listdir(img_dir):
+                if fname.endswith('_0000.tif'):
+                    cn = fname[:-len('_0000.tif')]
+                    if cn not in known:
+                        errors.append(f'  ORPHAN image  : {os.path.join(img_dir, fname)}')
+        if os.path.isdir(lbl_dir):
+            for fname in os.listdir(lbl_dir):
+                if fname.endswith('.tif'):
+                    cn = fname[:-len('.tif')]
+                    if cn not in known:
+                        errors.append(f'  ORPHAN label  : {os.path.join(lbl_dir, fname)}')
+
+    if errors:
+        print(f'\n[INTEGRITY] {len(errors)} problem(s) found:')
+        for e in errors[:20]:
+            print(e)
+        if len(errors) > 20:
+            print(f'  ... ({len(errors) - 20} more)')
+        return False
+    else:
+        print(f'[INTEGRITY] OK — {len(tile_index)} index entries all match disk.')
+        return True
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def pad_tile(arr: np.ndarray, tile: int) -> np.ndarray:
@@ -108,7 +204,8 @@ def remap_tissue(tissue_flat: np.ndarray, remap: dict) -> np.ndarray:
 def tile_image(orig_arr: np.ndarray, label_arr: np.ndarray,
                source_name: str, case_idx: int,
                images_dir: str, labels_dir: str,
-               tile_index: dict, dry_run: bool) -> int:
+               tile_index: dict, dry_run: bool,
+               norm: str = 'none') -> int:
     """Tile one image+label pair with edge support. Returns new case_idx."""
     H, W = orig_arr.shape[:2]
     n = math.ceil(H / TILE_SIZE) * math.ceil(W / TILE_SIZE)
@@ -144,6 +241,7 @@ def tile_image(orig_arr: np.ndarray, label_arr: np.ndarray,
                 'actual_h':       ah,
                 'actual_w':       aw,
                 'split':          'test',
+                'norm':           norm,
             }
             case_idx += 1
             tile_col += 1
@@ -154,17 +252,53 @@ def tile_image(orig_arr: np.ndarray, label_arr: np.ndarray,
 # ── Main ──────────────────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('--dry-run', action='store_true',
                         help='Print what would be done without writing files')
+    parser.add_argument('--norm', default=None, choices=['none', 'histology', 'nyul'],
+                        help='Normalization to apply — MUST match the norm used '
+                             'when training tiles were created (stored in tile_index.json).')
+    parser.add_argument('--scale-file',
+                        default=os.path.join(
+                            WORKSPACE, 'nnUNet_preprocessed', 'Dataset001_NerveMAVI',
+                            'nyul_standard_scale.json'),
+                        help='Path to nyul_standard_scale.json (only for --norm nyul)')
     args = parser.parse_args()
 
     index_path = os.path.join(DATASET_DIR, 'tile_index.json')
+    images_tr  = os.path.join(DATASET_DIR, 'imagesTr')
+    labels_tr  = os.path.join(DATASET_DIR, 'labelsTr')
     images_ts  = os.path.join(DATASET_DIR, 'imagesTs')
     labels_ts  = os.path.join(DATASET_DIR, 'labelsTs')
 
     # ── Load tile index ───────────────────────────────────────────────────────
     tile_index = json.load(open(index_path))
+
+    # ── Detect norm used by training tiles ───────────────────────────────────
+    train_norms = set(
+        v.get('norm', 'none')
+        for v in tile_index.values()
+        if v.get('split') == 'train'
+    )
+    detected_norm = train_norms.pop() if len(train_norms) == 1 else None
+
+    if args.norm is None:
+        if detected_norm is not None:
+            print(f'[INFO] Detected training norm from tile_index.json: "{detected_norm}"')
+            print(f'[INFO] Using --norm {detected_norm} automatically.')
+            args.norm = detected_norm
+        else:
+            print('ERROR: Could not detect training norm from tile_index.json.')
+            print('       Pass --norm explicitly: none | histology | nyul')
+            sys.exit(1)
+    elif detected_norm is not None and args.norm != detected_norm:
+        print(f'ERROR: --norm {args.norm!r} does not match training tiles norm {detected_norm!r}.')
+        print('       Test tiles MUST use the same normalization as training tiles.')
+        print('       If you intentionally want a different norm, run retile_all.py instead.')
+        sys.exit(1)
+
+    print(f'Normalization    : {args.norm}')
 
     # ── Step 1: remove old test tiles ─────────────────────────────────────────
     old_test = [k for k, v in tile_index.items() if v.get('split') == 'test']
@@ -199,13 +333,17 @@ def main():
             print(f'  SKIP (no label): {stem}')
             continue
 
-        orig_arr  = np.array(Image.open(img_path).convert('L'))
+        orig_arr  = normalize_image(
+            np.array(Image.open(img_path).convert('L')),
+            args.norm, args.scale_file,
+        )
         label_arr = remap_gtex(np.array(Image.open(lbl_path)))
         print(f'  {stem}')
         case_idx = tile_image(orig_arr, label_arr,
                               f'{stem}.tif', case_idx,
                               images_ts, labels_ts,
-                              tile_index, args.dry_run)
+                              tile_index, args.dry_run,
+                              norm=args.norm)
 
     # ── Step 3: Re-tile Bio-Aegis test images ──────────────────────────────────
     print('\n=== Bio-Aegis test images ===')
@@ -221,7 +359,10 @@ def main():
             print(f'  SKIP (no image): {h5fname}')
             continue
 
-        orig_arr = np.array(Image.open(img_path).convert('L'))
+        orig_arr = normalize_image(
+            np.array(Image.open(img_path).convert('L')),
+            args.norm, args.scale_file,
+        )
         H_img, W_img = orig_arr.shape
 
         with h5py.File(os.path.join(ISEG_SRC, h5fname), 'r') as f:
@@ -239,7 +380,8 @@ def main():
         case_idx = tile_image(orig_arr, label_arr,
                               src_name, case_idx,
                               images_ts, labels_ts,
-                              tile_index, args.dry_run)
+                              tile_index, args.dry_run,
+                              norm=args.norm)
 
     # ── Save updated tile index ───────────────────────────────────────────────
     if not args.dry_run:
@@ -251,6 +393,10 @@ def main():
 
     new_test = [k for k, v in tile_index.items() if v.get('split') == 'test']
     print(f'Total test tiles now: {len(new_test)}')
+
+    # ── Integrity check ───────────────────────────────────────────────────────
+    if not args.dry_run:
+        check_index_integrity(tile_index, images_tr, labels_tr, images_ts, labels_ts)
 
 
 if __name__ == '__main__':

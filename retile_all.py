@@ -151,7 +151,8 @@ def normalize_image(arr: np.ndarray, method: str, scale_file: str = None) -> np.
 def tile_image(orig_arr: np.ndarray, label_arr: np.ndarray,
                source_file: str, split: str,
                case_idx: int, images_dir: str, labels_dir: str,
-               tile_index: dict, dry_run: bool) -> int:
+               tile_index: dict, dry_run: bool,
+               norm: str = 'none') -> int:
     """
     Slice orig_arr and label_arr into TILE_SIZE tiles, write them, update
     tile_index, and return the number of tiles written.
@@ -159,18 +160,25 @@ def tile_image(orig_arr: np.ndarray, label_arr: np.ndarray,
     H, W = orig_arr.shape[:2]
     n_written = 0
     tile_row = 0
-    for y in range(0, H - TILE_SIZE + 1, TILE_SIZE):
+    for y in range(0, H, TILE_SIZE):
         tile_col = 0
-        for x in range(0, W - TILE_SIZE + 1, TILE_SIZE):
+        for x in range(0, W, TILE_SIZE):
+            ah = min(TILE_SIZE, H - y)  # actual content rows in this tile
+            aw = min(TILE_SIZE, W - x)  # actual content cols in this tile
             case_name = f"{CASE_PREFIX}_{case_idx:04d}"
             if not dry_run:
+                # Pad to full TILE_SIZE so nnUNet sees uniform-size inputs
+                img_tile = np.zeros((TILE_SIZE, TILE_SIZE) + orig_arr.shape[2:], dtype=orig_arr.dtype)
+                img_tile[:ah, :aw] = orig_arr[y : y + ah, x : x + aw]
+                lbl_tile = np.zeros((TILE_SIZE, TILE_SIZE), dtype=label_arr.dtype)
+                lbl_tile[:ah, :aw] = label_arr[y : y + ah, x : x + aw]
                 tifffile.imwrite(
                     os.path.join(images_dir, f"{case_name}_0000.tif"),
-                    orig_arr[y : y + TILE_SIZE, x : x + TILE_SIZE],
+                    img_tile,
                 )
                 tifffile.imwrite(
                     os.path.join(labels_dir, f"{case_name}.tif"),
-                    label_arr[y : y + TILE_SIZE, x : x + TILE_SIZE],
+                    lbl_tile,
                 )
             tile_index[case_name] = {
                 "source_file"   : source_file,
@@ -181,7 +189,10 @@ def tile_image(orig_arr: np.ndarray, label_arr: np.ndarray,
                 "y_offset"      : y,
                 "x_offset"      : x,
                 "tile_size"     : TILE_SIZE,
+                "actual_h"      : ah,
+                "actual_w"      : aw,
                 "split"         : split,
+                "norm"          : norm,
             }
             case_idx  += 1
             n_written += 1
@@ -319,10 +330,11 @@ def main():
             print(f"  SKIP size mismatch img={W}x{H} lbl={label_arr.shape}: {image_file}")
             continue
 
-        n_tiles = (H // TILE_SIZE) * (W // TILE_SIZE)
+        import math
+        n_tiles = math.ceil(H / TILE_SIZE) * math.ceil(W / TILE_SIZE)
         print(
             f"  [{split:5s}] [{src_type:4s}]  {image_file}\n"
-            f"           {H}×{W}  →  {n_tiles} tiles"
+            f"           {H}×{W}  →  {n_tiles} tiles (incl. edge padding)"
             f"  (cases {case_idx}–{case_idx + n_tiles - 1})"
         )
 
@@ -330,6 +342,7 @@ def main():
             orig_arr, label_arr, image_file, split,
             case_idx, images_dir, labels_dir,
             tile_index, dry_run=args.dry_run,
+            norm=args.norm,
         )
         case_idx += n_written
         if split == "train":
