@@ -201,3 +201,93 @@ class nnUNetTrainerAdamEarlyStopping_TverskyPerClass(nnUNetTrainerAdamEarlyStopp
             loss = DeepSupervisionWrapper(loss, weights)
 
         return loss
+
+
+class nnUNetTrainerAdamEarlyStopping_TverskyPerClassSoft(nnUNetTrainerAdamEarlyStopping):
+    """
+    Softened Per-class Focal Tversky + CE trainer.
+
+    A milder re-tuning of TverskyPerClass after it was found to degrade
+    NerveFascicle (Dice 0.914 → 0.822) and Blood vessel (0.626 → 0.420)
+    while only partially recovering Adipose over the TV_Nyul baseline.
+
+    Root cause: high β + high class_weights + high γ over-penalised FNs on
+    hard/domain-shifted classes and pushed the optimiser to inflate background.
+    The softened params keep a meaningful recall bias without destabilising the
+    other foreground classes.
+
+    Changes vs TverskyPerClass (aggressive):
+      alpha:         [0.4, 0.2, 0.2, 0.4]  →  [0.3, 0.3, 0.3, 0.3]
+      beta:          [0.6, 0.8, 0.8, 0.6]  →  [0.70, 0.75, 0.75, 0.80]
+      class_weights: [0.5, 1.5, 1.5, 0.5]  →  [1.0, 1.2, 1.2, 1.5]
+      gamma:          1.33                 →   1.15
+
+    Blood vessel kept at the highest β (0.80) and weight (1.5) because it is the
+    rarest class (0–1.4 % GT) and was most damaged by the aggressive version.
+    Adipose and fascicle get a modest recall bias without fully overwhelming
+    connective tissue gradients.
+
+    Best used alongside BioAegisOversample (sampling fix) rather than as a
+    standalone loss fix — the Adipose gap on Bio-Aegis is primarily a domain-shift
+    / underrepresentation problem, not solely a loss problem.
+    """
+
+    def __init__(self, plans: dict, configuration: str, fold: int, dataset_json: dict,
+                 device: torch.device = torch.device('cuda')):
+        self.initial_lr = 3e-4
+        super().__init__(plans, configuration, fold, dataset_json, device)
+
+    def configure_optimizers(self):
+        self.initial_lr = 3e-4
+        return super().configure_optimizers()
+
+    def _build_loss(self):
+        if self.label_manager.has_regions:
+            return super()._build_loss()
+
+        from nnunetv2.utilities.helpers import softmax_helper_dim1
+
+        # ── Per-class α, β (foreground classes 1–4, background excluded) ──────
+        # Uniform FP penalty; graduated recall bias with blood vessel highest.
+        alpha_per_class = [0.3,  0.3,  0.3,  0.3 ]   # cls 1 (connec), 2 (adip), 3 (nerve), 4 (blood)
+        beta_per_class  = [0.70, 0.75, 0.75, 0.80]   # cls 1, 2, 3, 4
+        tversky_cw      = [1.0,  1.2,  1.2,  1.5 ]   # blood highest; mild boost for adip/nerve
+
+        # ── CE weights from actual training-tile distribution ────────────────
+        ce_weights = torch.tensor(
+            [0.1925, 0.4746, 1.7389, 0.8647, 1.7294],
+            dtype=torch.float32, device=self.device,
+        )
+
+        loss = Tversky_and_CE_loss_PerClass(
+            tversky_kwargs=dict(
+                apply_nonlin=softmax_helper_dim1,
+                alpha=alpha_per_class,
+                beta=beta_per_class,
+                class_weights=tversky_cw,
+                gamma=1.15,
+                smooth=1.0,
+                do_bg=False,
+                batch_dice=self.configuration_manager.batch_dice,
+                ddp=self.is_ddp,
+            ),
+            ce_kwargs={'weight': ce_weights},
+            weight_ce=1.0,
+            weight_tversky=1.0,
+            ignore_label=self.label_manager.ignore_label,
+        )
+
+        if self._do_i_compile():
+            loss.tversky = torch.compile(loss.tversky)
+
+        if self.enable_deep_supervision:
+            deep_supervision_scales = self._get_deep_supervision_scales()
+            weights = np.array([1 / (2 ** i) for i in range(len(deep_supervision_scales))])
+            if self.is_ddp and not self._do_i_compile():
+                weights[-1] = 1e-6
+            else:
+                weights[-1] = 0
+            weights = weights / weights.sum()
+            loss = DeepSupervisionWrapper(loss, weights)
+
+        return loss

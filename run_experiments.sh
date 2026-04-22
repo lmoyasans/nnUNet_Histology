@@ -1,24 +1,31 @@
 #!/usr/bin/env bash
 # =============================================================================
 # run_experiments.sh
-# Runs 6 training experiments (3 normalisations × 2 losses),
-# then runs inference for each, then reconstructs full-image predictions.
+# Runs training experiments, inference, and reconstruction.
+#
+# Phase 1 (6 experiments — 3 normalisations × 2 losses):
+#   CE_Histo   – DC+CE loss   + Histology pre-tiling norm (nnUNetPlansHistoNorm)
+#   CE_Nyul    – DC+CE loss   + Nyul pre-tiling norm      (nnUNetPlansNyulNorm)
+#   CE_NoNorm  – DC+CE loss   + No normalization          (nnUNetPlansNoNorm)
+#   TV_Histo   – Tversky loss + Histology pre-tiling norm
+#   TV_Nyul    – Tversky loss + Nyul pre-tiling norm      ← best baseline
+#   TV_NoNorm  – Tversky loss + No normalization
+#
+# Phase 2 (4 experiments — sampling + augmentation + loss refinement, Nyul norm only):
+#   TV_Nyul_SourceEq          – TV_Nyul + per-source equalized sampling (auto, no hardcoded names)
+#   TV_Nyul_SourceEq_HistoAug – TV_Nyul + equalized sampling + wider histology augmentation
+#   TV_PC_Soft_Nyul           – Softened per-class focal Tversky (no oversampling)
+#   TV_PC_Soft_SourceEq       – Softened focal Tversky + equalized sampling
 #
 # Normalization is applied to FULL IMAGES during the tiling step (Phase 0)
 # so that intensity statistics are computed over the whole slide, not per tile.
 # All nnUNet plans use NoNormalization to avoid a second per-tile pass.
 #
-# Experiments:
-#   CE_Histo   – DC+CE loss   + Histology pre-tiling norm (nnUNetPlansHistoNorm)
-#   CE_Nyul    – DC+CE loss   + Nyul pre-tiling norm      (nnUNetPlansNyulNorm)
-#   CE_NoNorm  – DC+CE loss   + No normalization          (nnUNetPlansNoNorm)
-#   TV_Histo   – Tversky loss + Histology pre-tiling norm
-#   TV_Nyul    – Tversky loss + Nyul pre-tiling norm
-#   TV_NoNorm  – Tversky loss + No normalization
-#
 # Usage:
-#   bash run_experiments.sh [--skip-tile] [--skip-train] [--skip-predict] [--fold F]
-#   --skip-tile    : skip re-tiling and preprocessing (use existing nnUNet_raw data)
+#   bash run_experiments.sh                     # full Phase 1 run
+#   bash run_experiments.sh --skip-tile         # Phase 1, skip tiling
+#   bash run_experiments.sh --phase2-only       # Phase 2 only (requires Phase 1 Nyul preprocessed)
+#   bash run_experiments.sh --skip-tile --phase2-only  # same, explicit
 #   --skip-train   : skip training, only run inference + reconstruction
 #   --skip-predict : skip inference + reconstruction, only tile + train
 #   --fold F       : use fold F (default: 0)
@@ -48,16 +55,21 @@ NYUL_SCALE="$nnUNet_preprocessed/Dataset001_NerveMAVI/nyul_standard_scale.json"
 SKIP_TILE=false
 SKIP_TRAIN=false
 SKIP_PREDICT=false
+PHASE2_ONLY=false
 
 # ── Parse args ────────────────────────────────────────────────────────────────
 for arg in "$@"; do
     case "$arg" in
-        --skip-tile)    SKIP_TILE=true     ;;
-        --skip-train)   SKIP_TRAIN=true    ;;
-        --skip-predict) SKIP_PREDICT=true  ;;
-        --fold)         shift; FOLD="$1"   ;;
+        --skip-tile)    SKIP_TILE=true    ;;
+        --skip-train)   SKIP_TRAIN=true   ;;
+        --skip-predict) SKIP_PREDICT=true ;;
+        --phase2-only)  PHASE2_ONLY=true  ;;
+        --fold)         shift; FOLD="$1"  ;;
     esac
 done
+
+# --phase2-only implies skip tiling (Phase 2 reuses Nyul preprocessed data)
+[ "$PHASE2_ONLY" = true ] && SKIP_TILE=true
 
 # ── Experiment table: (label, trainer, plan) ─────────────────────────────────
 # All plans use NoNormalization internally — normalization is applied to the
@@ -86,6 +98,35 @@ declare -a PLANS=(
     "nnUNetPlansHistoNorm"
     "nnUNetPlansNyulNorm"
     "nnUNetPlansNoNorm"
+)
+
+# ── Phase 2 experiments (sampling + loss refinement) ─────────────────────────
+# Run after Phase 1 confirmed TV_Nyul as best baseline.
+#
+# TV_Nyul_SourceEq         – TV_Nyul + per-source equalized sampling only
+#                            (isolates the sampling contribution)
+# TV_Nyul_SourceEq_HistoAug – TV_Nyul + equalized sampling + wider histology aug
+#                            (recommended: fixes both frequency and appearance shift)
+# TV_PC_Soft_Nyul          – Softened per-class focal Tversky, no oversampling
+#                            (isolates whether loss tuning alone helps)
+# TV_PC_Soft_SourceEq      – Softened focal Tversky + equalized sampling
+declare -a PHASE2_LABELS=(
+    "TV_Nyul_SourceEq"
+    "TV_Nyul_SourceEq_HistoAug"
+    "TV_PC_Soft_Nyul"
+    "TV_PC_Soft_SourceEq"
+)
+declare -a PHASE2_TRAINERS=(
+    "nnUNetTrainerAdamEarlyStopping_Tversky_SourceEqualized"
+    "nnUNetTrainerAdamEarlyStopping_Tversky_SourceEqualized_HistoAug"
+    "nnUNetTrainerAdamEarlyStopping_TverskyPerClassSoft"
+    "nnUNetTrainerAdamEarlyStopping_TverskyPerClassSoft_SourceEqualized"
+)
+declare -a PHASE2_PLANS=(
+    "nnUNetPlansNyulNorm"
+    "nnUNetPlansNyulNorm"
+    "nnUNetPlansNyulNorm"
+    "nnUNetPlansNyulNorm"
 )
 
 N=${#LABELS[@]}
@@ -170,6 +211,7 @@ declare -A NORM_INDICES=(
 TRAIN_FAILED=0
 
 for NORM in histology nyul none; do
+[ "$PHASE2_ONLY" = true ] && continue   # skip Phase 1 when --phase2-only
     PLAN="${NORM_PLAN[$NORM]}"
     INDICES="${NORM_INDICES[$NORM]}"
 
@@ -234,6 +276,49 @@ for NORM in histology nyul none; do
 
 done
 
+
+# =============================================================================
+# Phase 2 — Sampling + loss refinement experiments (Nyul norm only)
+# These reuse the preprocessed nnUNetPlansNyulNorm_2d data from Phase 1
+# (no retiling or re-preprocessing needed).
+# Run with:  bash run_experiments.sh --phase2-only
+# =============================================================================
+
+if [ "$PHASE2_ONLY" = true ]; then
+    PHASE2_PLAN="nnUNetPlansNyulNorm"
+    N2=${#PHASE2_LABELS[@]}
+
+    echo ""
+    echo "================================================================"
+    echo "PHASE 2: Sampling + loss refinement  (plan: $PHASE2_PLAN)"
+    echo "================================================================"
+
+    # Training
+    if [ "$SKIP_TRAIN" = false ]; then
+        for (( i=0; i<N2; i++ )); do
+            LABEL="${PHASE2_LABELS[$i]}"
+            TRAINER="${PHASE2_TRAINERS[$i]}"
+            LOG="$LOG_DIR/train_${LABEL}.log"
+            echo "  [train] $LABEL → $LOG"
+            if "$NNUNET_TRAIN" $DATASET_ID $CONFIG $FOLD \
+                   -tr "$TRAINER" -p "$PHASE2_PLAN" \
+                   > "$LOG" 2>&1; then
+                echo "  [train] ✓ $LABEL done"
+            else
+                echo "  [train] ✗ $LABEL FAILED — check $LOG"
+            fi
+        done
+    fi
+
+    # Inference + reconstruction
+    if [ "$SKIP_PREDICT" = false ]; then
+        for (( i=0; i<N2; i++ )); do
+            LABEL="${PHASE2_LABELS[$i]}"
+            TRAINER="${PHASE2_TRAINERS[$i]}"
+            run_predict_and_reconstruct "$LABEL" "$TRAINER" "$PHASE2_PLAN" || true
+        done
+    fi
+fi
 
 
 echo ""

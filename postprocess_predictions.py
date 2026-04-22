@@ -56,8 +56,9 @@ EXPERIMENTS = [
     ('CE_Nyul',    'nnUNetTrainerAdamEarlyStopping_LowLR',   'nnUNetPlansNyulNorm'),
     ('CE_NoNorm',  'nnUNetTrainerAdamEarlyStopping_LowLR',   'nnUNetPlansNoNorm'),
     ('TV_Histo',   'nnUNetTrainerAdamEarlyStopping_Tversky', 'nnUNetPlansHistoNorm'),
-    ('TV_Nyul',    'nnUNetTrainerAdamEarlyStopping_Tversky', 'nnUNetPlansNyulNorm'),
-    ('TV_NoNorm',  'nnUNetTrainerAdamEarlyStopping_Tversky', 'nnUNetPlansNoNorm'),
+    ('TV_Nyul',    'nnUNetTrainerAdamEarlyStopping_Tversky',         'nnUNetPlansNyulNorm'),
+    ('TV_NoNorm',  'nnUNetTrainerAdamEarlyStopping_Tversky',         'nnUNetPlansNoNorm'),
+    ('TV_PC_Nyul', 'nnUNetTrainerAdamEarlyStopping_TverskyPerClass', 'nnUNetPlansNyulNorm'),
 ]
 
 # Classes processed in ascending priority order (later = higher priority)
